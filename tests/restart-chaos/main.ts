@@ -28,6 +28,7 @@ import { checkPlanInvariants, summarizeViolations, type InvariantCheck } from ".
 import { appendLedger, ledgerLine, writeSummary, type LedgerLine } from "./ledger.js";
 import { collectWaveSpeed, speedMarkdown } from "./wave-speed.js";
 import { TaskObserver, childSpeedTasksInTurn } from "./observer.js";
+import { planMatrixWave } from "./journey-matrix.js";
 import { StormRun, TASK_FAULT_LOG, observedFaultSchedule, planWave, replayOnCurrentBuild, replayRecordFor, replayWave, type TaskFaultLog } from "./scheduler.js";
 import { chaosLifecycleOverrides, seedChaosLab } from "./seed.js";
 import { ChaosSupervisor } from "./supervisor.js";
@@ -73,7 +74,8 @@ async function loadPlan(): Promise<{ plan: WavePlan; keep: boolean }> {
     }
     return { plan, keep: command.keep };
   }
-  return { plan: planWave(waveIdFor(command.options.seed), command.options), keep: command.keep };
+  const waveId = waveIdFor(command.options.seed);
+  return { plan: command.options.matrix ? planMatrixWave(waveId, command.options) : planWave(waveId, command.options), keep: command.keep };
 }
 
 function run(command: string, args: string[], cwd: string, label: string) {
@@ -130,7 +132,8 @@ function preflight(plan: WavePlan) {
     ?? path.join(repositoryRoot, "packages/paperclip-runner/runner/target/debug/paperclip-runnerd");
   if (!existsSync(runner)) throw new Error(`Runner binary missing at ${runner}. Run: pnpm --filter @paperclipai/paperclip-runner run build:runner-binaries`);
   // K14: the older checkout must be prepared (installed and built) before the wave, like this one.
-  const upgradeFrom = plan.options.upgradeFrom;
+  // `--server-from` runs the whole wave on another prepared checkout, prepared like an upgrade's older build.
+  const upgradeFrom = plan.options.upgradeFrom ?? plan.options.serverFrom;
   // One runner binary for both builds would not test the older runner's saved state.
   if (upgradeFrom && process.env.PAPERCLIP_RUNNER_BINARY) {
     throw new Error("--upgrade-from runs each build's own runner; unset PAPERCLIP_RUNNER_BINARY");
@@ -185,7 +188,7 @@ async function main(): Promise<number> {
   const batchSize = crashPoints.length ? Math.max(1, Math.floor(plan.tasks.length / crashPoints.length)) : 0;
   if (crashPoint && plan.tasks.length !== batchSize * crashPoints.length) throw new Error(`--tasks must be a multiple of the ${crashPoints.length} crash point(s)`);
   const supervisor = await ChaosSupervisor.create({ repositoryRoot, waveDir, timeline,
-    ...(plan.options.upgradeFrom ? { upgradeFrom: plan.options.upgradeFrom } : {}) });
+    ...(plan.options.upgradeFrom ?? plan.options.serverFrom ? { upgradeFrom: plan.options.upgradeFrom ?? plan.options.serverFrom } : {}) });
   // Crash-point suite: one booted server, one point at a time. Each point gets
   // its own batch of tasks; the point is armed once the batch launched and the
   // server kills itself at its nth hit (restarted like K1). Invariants are

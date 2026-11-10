@@ -1,3 +1,4 @@
+import { isJourneyWorkload } from "./journeys.js";
 import { workloadDefinitions } from "./workloads.js";
 import type { AdapterId, FaultKind, ScheduledFault, StormFault, StormPlan, TaskFaultKind, TaskPlan, TriggerId, WavePlan, WaveOptions, WorkloadId } from "./types.js";
 import type { ReplayRef } from "./config.js";
@@ -45,6 +46,8 @@ export const TRIGGER_DELAY_RANGE_MS: Record<Exclude<TriggerId, "time">, readonly
   approval: [0, 3_000],
   paused: [0, 3_000],
   stop: [0, 2_000],
+  asked: [0, 3_000],
+  answered: [0, 3_000],
 };
 
 export function triggerFitsWorkload(trigger: TriggerId, workload: WorkloadId): boolean {
@@ -53,11 +56,13 @@ export function triggerFitsWorkload(trigger: TriggerId, workload: WorkloadId): b
   if (trigger === "approval") return workload === "G1";
   if (trigger === "paused") return workload === "H1";
   if (trigger === "stop") return workload === "S1";
+  if (trigger === "asked" || trigger === "answered") return isJourneyWorkload(workload);
   return true;
 }
 
 /** The workload a trigger needs, for the error when none is selected. */
-const TRIGGER_WORKLOAD: Partial<Record<TriggerId, WorkloadId>> = { comment: "C1", result: "C1", tool: "B5", approval: "G1", paused: "H1", stop: "S1" };
+const TRIGGER_WORKLOAD: Partial<Record<TriggerId, string>> = { comment: "C1", result: "C1", tool: "B5", approval: "G1", paused: "H1", stop: "S1",
+  asked: "Q1, Q2 or Q3", answered: "Q1, Q2 or Q3" };
 
 /** Faults a `result` task may fire inside a storm: a fast restart that lands on the boundary. */
 const STORM_RESULT_FAULTS: readonly FaultKind[] = ["K1", "K2"];
@@ -273,7 +278,7 @@ export function observedFaultSchedule(createdAt: number | null, faultIds: readon
 /** The faults a task schedules: its replayed sequence, or its one planned fault. */
 export function taskFaultSchedule(task: TaskPlan): ScheduledFault[] {
   if (task.replayFaults?.length) return task.replayFaults;
-  if (task.fault === "K13") return [];
+  if (task.fault === "K13" || task.fault === "K0") return [];
   const planned: ScheduledFault = { kind: task.fault, holdMs: task.holdMs, atMs: task.fireAfterMs };
   const trigger = task.trigger ?? "time";
   if (trigger === "time") return [planned];

@@ -3,17 +3,21 @@
 /** K14 (upgrade mid-run): a graceful stop, then the replacement starts from the current build (`--upgrade-from`). */
 export const FAULT_KINDS = ["K1", "K2", "K4", "K6", "K14"] as const;
 export type FaultKind = (typeof FAULT_KINDS)[number];
-/** A task's planned fault. "K13" (restart storm) tasks have none of their own; the wave's storm crosses them. */
-export type TaskFaultKind = FaultKind | "K13";
+/**
+ * A task's planned fault. "K13" (restart storm) tasks have none of their own; the wave's storm crosses them.
+ * "K0" is a `--matrix` baseline cell: the same journey with no fault.
+ */
+export type TaskFaultKind = FaultKind | "K13" | "K0";
 
-/** G1: an approval-gated action across a restart. H1: a budget hard stop crossed mid-run with a restart (its own wave). */
-export const WORKLOAD_IDS = ["A1", "B1", "B5", "C1", "M1", "G1", "H1", "R1", "S1"] as const;
+/** G1: an approval-gated action across a restart. H1: a budget hard stop crossed mid-run with a restart (its own wave). Q1–Q3: journeys.ts. */
+export const WORKLOAD_IDS = ["A1", "B1", "B5", "C1", "M1", "G1", "H1", "R1", "S1", "Q1", "Q2", "Q3"] as const;
 export type WorkloadId = (typeof WORKLOAD_IDS)[number];
 
 export const ADAPTER_IDS = ["codex", "claude", "opencode"] as const;
 export type AdapterId = (typeof ADAPTER_IDS)[number];
 
-export const TRIGGER_IDS = ["time", "comment", "retry", "queued", "tool", "result", "approval", "paused", "stop"] as const;
+/** `asked` and `answered`: the journey boundaries of Q1–Q3 (journeys.ts). */
+export const TRIGGER_IDS = ["time", "comment", "retry", "queued", "tool", "result", "approval", "paused", "stop", "asked", "answered"] as const;
 export type TriggerId = (typeof TRIGGER_IDS)[number];
 
 export const ENVIRONMENT_KINDS = ["local", "daytona"] as const;
@@ -80,6 +84,10 @@ export interface WaveOptions {
   storageWindows?: import("./storage-chaos.js").StorageFaultWindow[];
   workspaceCommit?: string;
   workspaceGitUrl?: string;
+  /** `--matrix`: one task per workload × adapter × (K0, or each fault at each of the workload's triggers). */
+  matrix?: boolean;
+  /** `--server-from <dir>`: every server of the wave runs from this prepared checkout (for example a pre-fix commit). */
+  serverFrom?: string;
 }
 
 export interface StormFault {
@@ -240,6 +248,8 @@ export interface OracleArtifacts {
   approvals?: Array<{ id: string; status: string; title: string | null }>;
   /** G1 and H1: the board's actions and what the observer saw around them. */
   governance?: GovernanceRecord;
+  /** Q1–Q3: what the board did and what the task, its runs and the harness's app saw. */
+  journey?: import("./journeys.js").JourneyArtifacts;
 }
 
 /** What the board did for a governance task (G1, H1), and what the observer saw. */
@@ -323,6 +333,8 @@ export interface TaskRecord {
   governance?: GovernanceRecord;
   /** K14 waves: the build serving when the task launched. */
   serverBuildAtLaunch?: "upgrade_from" | "current";
+  /** Q1–Q3: the board's journey actions (journey-driver.ts). */
+  journey?: import("./journeys.js").JourneyRecord;
 }
 
 export interface TaskGrade {

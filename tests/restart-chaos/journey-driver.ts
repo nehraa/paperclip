@@ -1,0 +1,384 @@
+/**
+ * The board's side of the journey workloads (journeys.ts). Each poll the observer
+ * hands the driver its sample; the driver acts through the routes the board UI
+ * uses, only while the server is ready and no fault is in progress, and records
+ * what it did and saw on `record.journey`.
+ */
+import { readFileSync } from "node:fs";
+import { ChaosApiError, type ChaosApi } from "./api.js";
+import { ACTIVE_RUN_STATUSES } from "./grader.js";
+import { startOAuthApp, TOOL_NAME, type OAuthApp } from "./journey-oauth-app.js";
+import {
+  ANSWER_TURN_WAIT_MS, answerMarker, isJourneyWorkload, journeyChoice, Q3_REVIEW_AGE_MS, q3ToolArgument, QUESTION_ID,
+  type JourneyArtifacts, type JourneyRecord, type JourneyWorkload,
+} from "./journeys.js";
+import type { ChaosLab } from "./seed.js";
+import type { Timeline } from "./timeline.js";
+import type { ScheduledFault, TaskPlan, TaskRecord, TaskSample } from "./types.js";
+
+type Json = Record<string, any>;
+
+export interface JourneyHost {
+  plan: TaskPlan;
+  api: ChaosApi;
+  lab: ChaosLab;
+  timeline: Timeline;
+  record: TaskRecord;
+  /** The wave database (Q3 moves the review's saved timestamps). */
+  databaseUrl: () => string | null;
+}
+
+/** What the observer knows each poll that the board's decision depends on. */
+export interface JourneyTick {
+  sample: TaskSample;
+  now: number;
+  /** Server ready and no fault in progress. */
+  quiet: boolean;
+  /** The task's faults that have not fired yet. */
+  pendingFaults: readonly ScheduledFault[];
+}
+
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+const httpStatus = (error: unknown) => error instanceof ChaosApiError ? error.status : null;
+const hasActiveRun = (sample: TaskSample) => (sample.runs ?? []).some(run => ACTIVE_RUN_STATUSES.has(run.status));
+
+/** The scripted Q3 agent: one connected-app call, then report the reviewed result. Adapted from tests/e2e/connection-reviews.spec.ts. */
+export function q3AgentScript(connectionId: string, title: string): string {
+  return `
+const base = process.env.PAPERCLIP_API_URL + "/api";
+const headers = { authorization: "Bearer " + process.env.PAPERCLIP_API_KEY, "content-type": "application/json", "x-paperclip-run-id": process.env.PAPERCLIP_RUN_ID };
+const api = async (path, method = "GET", body) => {
+  const response = await fetch(base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  if (!response.ok) throw new Error(method + " " + path + " " + response.status + ": " + await response.text());
+  return await response.json();
+};
+const issueId = process.env.PAPERCLIP_TASK_ID ?? (await api("/heartbeat-runs/" + process.env.PAPERCLIP_RUN_ID)).contextSnapshot.issueId;
+const review = (await api("/issues/" + issueId + "/interactions")).find(item => item.payload?.toolAction);
+if (review?.status === "pending") { console.log("Waiting for the saved review; no retry."); process.exit(0); }
+if (review) {
+  const result = review.result?.toolAction;
+  if (review.status === "accepted" && (!result || ["approved", "executing"].includes(result.status))) { console.log("Approved; waiting for the stored result."); process.exit(0); }
+  const executed = review.status === "accepted" && result?.status === "executed";
+  await api("/issues/" + issueId + "/comments", "POST", { body: (executed ? "Q3 result: " : "Q3 review ended " + review.status + ": ") + JSON.stringify(result ?? null) });
+  if (executed) await api("/issues/" + issueId, "PATCH", { status: "done" });
+  process.exit(0);
+}
+const session = await api("/tool-gateway/sessions", "POST", { runId: process.env.PAPERCLIP_RUN_ID, ttlMs: 60000 });
+const gatewayHeaders = { "x-paperclip-tool-gateway-token": session.token, "content-type": "application/json" };
+const tools = await (await fetch(base + "/tool-gateway/tools", { headers: gatewayHeaders })).json();
+const tool = tools.find(t => t.connectionId === ${JSON.stringify(connectionId)});
+if (!tool) throw new Error("The chaos app tool is not available to this agent");
+const call = await fetch(base + "/tool-gateway/tools/call", { method: "POST", headers: gatewayHeaders, body: JSON.stringify({ tool: tool.name, parameters: { title: ${JSON.stringify(title)} } }) });
+const outcome = await call.json();
+if (!call.ok) {
+  if (!JSON.stringify(outcome).includes("approval_required")) throw new Error(JSON.stringify(outcome));
+  await api("/issues/" + issueId, "PATCH", { status: "in_review" });
+  console.log("Waiting for the board's review. No retry.");
+  process.exit(0);
+}
+await api("/issues/" + issueId + "/comments", "POST", { body: "Q3 ran without review: " + JSON.stringify(outcome) });
+`;
+}
+
+export class JourneyDriver {
+  private app: OAuthApp | null = null;
+  /** Q2: ready time accumulated since the answer, for the answer-turn wait. */
+  private quietSinceAnswerMs = 0;
+  private lastTickAt: number | null = null;
+
+  constructor(readonly workload: JourneyWorkload, private readonly host: JourneyHost) {
+    const own = host.plan.trigger && host.plan.trigger !== "time" ? host.plan.trigger : null;
+    this.state.faultTrigger = own;
+  }
+
+  get state(): JourneyRecord { return this.host.record.journey ??= {}; }
+
+  /** Q3: the scripted agent that calls the connected app; others use the seeded agent. */
+  get assigneeAgentId(): string | null { return this.state.app?.agentId ?? null; }
+
+  /** Q3: start the harness's OAuth app, connect it as the board, and hire the scripted agent. */
+  async prepare(): Promise<void> {
+    if (this.workload !== "Q3" || this.state.app) return;
+    const { api, lab, plan, timeline } = this.host;
+    const app = this.app = await startOAuthApp();
+    const state: NonNullable<JourneyRecord["app"]> = this.state.app = { connectionId: null, agentId: null, receipt: app.receipt, setupError: null };
+    try {
+      const connected = await api.post<Json>(`/api/companies/${lab.companyId}/tools/apps/connect`,
+        { link: app.mcpUrl, name: `Chaos pages ${plan.nonce}`, grantKind: "organization" }, 30_000);
+      state.connectionId = String(connected.connectionId ?? connected.connection?.id);
+      const startUrl = connected.auth?.startUrl;
+      if (typeof startUrl !== "string") throw new Error(`connect returned no OAuth start URL: ${JSON.stringify(connected).slice(0, 300)}`);
+      // The browser visits the app, consents, and is sent back to Paperclip's callback.
+      const authorize = await fetch(startUrl, { redirect: "manual" });
+      const location = authorize.headers.get("location");
+      if (!location) throw new Error(`authorize returned ${authorize.status} without a redirect`);
+      const back = new URL(location);
+      const callback = await fetch(`${api.baseUrl}${back.pathname}${back.search}`,
+        { headers: { origin: api.baseUrl, accept: "application/json" }, redirect: "manual", signal: AbortSignal.timeout(30_000) });
+      if (callback.status >= 400) throw new Error(`OAuth callback returned ${callback.status}: ${(await callback.text()).slice(0, 300)}`);
+      const { catalog } = await api.get<{ catalog: Json[] }>(`/api/tool-connections/${state.connectionId}/catalog`);
+      const entry = (catalog ?? []).find(row => row.toolName === TOOL_NAME || String(row.upstreamToolName ?? "").endsWith(TOOL_NAME));
+      if (!entry) throw new Error(`catalog has no ${TOOL_NAME}: ${JSON.stringify(catalog).slice(0, 300)}`);
+      const agent = await api.post<Json>(`/api/companies/${lab.companyId}/agents`, {
+        name: `Chaos pages agent ${plan.nonce}`, role: "engineer", title: "Connected-app journey agent",
+        capabilities: "Creates one page with the chaos app after review.", adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["--input-type=module", "-e", q3AgentScript(state.connectionId, q3ToolArgument(plan.nonce))] },
+      });
+      state.agentId = String(agent.id);
+      // Apps → finish: this agent may use the app, and the write tool asks first.
+      await api.post(`/api/companies/${lab.companyId}/tools/apps/${state.connectionId}/finish`, {
+        enabledCatalogEntryIds: [entry.id], askFirstCatalogEntryIds: [entry.id], access: { agentIds: [state.agentId] } });
+      timeline.add("journey_app_connected", { taskId: plan.taskId, connectionId: state.connectionId, agentId: state.agentId, origin: app.origin });
+    } catch (error) {
+      state.setupError = errorText(error);
+      timeline.add("journey_app_setup_failed", { taskId: plan.taskId, error: state.setupError });
+    }
+  }
+
+  armedAt(trigger: "asked" | "answered"): number | null {
+    return trigger === "asked" ? this.state.requestSeenAt ?? null : this.state.answer?.doneAt ?? null;
+  }
+
+  /** The task waits on the board: not a rest, not a stall, no Retry. */
+  awaitingBoard(): boolean {
+    const state = this.state;
+    if (!state.requestSeenAt) return false;
+    if (this.workload === "Q2") return !state.blockerResolved && (!state.answer || state.answer.error === null);
+    return !state.answer;
+  }
+
+  /** One poll. Returns true when the board acted (the observer then needs fresh samples before rest). */
+  async step(tick: JourneyTick): Promise<boolean> {
+    const { sample, now, quiet } = tick;
+    const previous = this.lastTickAt;
+    this.lastTickAt = now;
+    if (quiet && previous !== null && this.state.answer) this.quietSinceAnswerMs += now - previous;
+    if (!sample.reachable || !this.host.record.issueId) return false;
+    if (this.workload === "Q3" && this.state.app?.setupError) return false;
+    if (!this.state.requestSeenAt && !(await this.findRequest(now))) return false;
+    // The board answers once every fault the task planned before the answer has fired.
+    const answerMayGo = quiet && tick.pendingFaults.every(fault => fault.trigger === "answered");
+    if (this.workload === "Q2" && !this.state.blocker) {
+      if (!quiet || hasActiveRun(sample)) return false;
+      await this.addPrerequisite(now);
+      return true;
+    }
+    if (!this.state.answer) {
+      if (!answerMayGo) return false;
+      if (this.workload === "Q2" && this.state.blocker?.error) return false;
+      if (this.workload === "Q3") await this.ageAndRefresh(now);
+      await this.respond(now);
+      return true;
+    }
+    if (this.workload !== "Q2" || this.state.answer.error !== null) return false;
+    if (!this.state.answerTurn) {
+      if (!quiet) return false;
+      if (await this.observeAnswerTurn(now, sample)) return false;
+      if (this.quietSinceAnswerMs < ANSWER_TURN_WAIT_MS) return false;
+      this.state.answerTurn = { missedAt: now };
+      this.host.timeline.add("journey_answer_turn_missed", { taskId: this.host.plan.taskId, waitedMs: this.quietSinceAnswerMs });
+    }
+    if (!this.state.blockerResolved && quiet && tick.pendingFaults.length === 0 && !hasActiveRun(sample)) {
+      await this.finishPrerequisite(now);
+      return true;
+    }
+    return false;
+  }
+
+  private async findRequest(now: number): Promise<boolean> {
+    const { api, lab, record, timeline, plan } = this.host;
+    let id: string | null = null;
+    if (this.workload === "Q3") {
+      const rows = await api.get<Json[] | { actionRequests?: Json[] }>(`/api/companies/${lab.companyId}/tools/action-requests?status=pending`, 5_000).catch(() => null);
+      const list = Array.isArray(rows) ? rows : rows?.actionRequests ?? [];
+      id = list.find(row => row.issueId === record.issueId)?.id ?? null;
+    } else {
+      const rows = await api.get<Json[]>(`/api/issues/${record.issueId}/interactions`, 5_000).catch(() => null);
+      id = (rows ?? []).find(row => row.kind === "ask_user_questions" && row.status === "pending")?.id ?? null;
+    }
+    if (!id) return false;
+    this.state.requestSeenAt = now;
+    this.state.requestId = String(id);
+    timeline.add("journey_request_pending", { taskId: plan.taskId, workload: this.workload, requestId: id });
+    return true;
+  }
+
+  /** Q2: the board adds an unfinished, unassigned prerequisite and marks the task blocked by it. */
+  private async addPrerequisite(now: number) {
+    const { api, lab, record, plan, timeline } = this.host;
+    const blocker: NonNullable<JourneyRecord["blocker"]> = { issueId: null, at: now, error: null };
+    try {
+      const created = await api.post<Json>(`/api/companies/${lab.companyId}/issues`,
+        { title: `Chaos Q2 prerequisite ${plan.nonce}`, status: "backlog", priority: "medium" });
+      blocker.issueId = String(created.id);
+      await api.patch(`/api/issues/${record.issueId}`, { status: "blocked", blockedByIssueIds: [blocker.issueId] });
+    } catch (error) {
+      blocker.error = errorText(error);
+    }
+    this.state.blocker = blocker;
+    timeline.add("journey_prerequisite_added", { taskId: plan.taskId, ...blocker });
+  }
+
+  /** Q3: the review waits more than an hour. Move its saved timestamps and the access token's expiry back. */
+  private async ageAndRefresh(now: number) {
+    const { api, plan, timeline } = this.host;
+    if (!this.state.timeShift) {
+      const shift: NonNullable<JourneyRecord["timeShift"]> = { at: now, ms: Q3_REVIEW_AGE_MS, requests: 0, grants: 0, error: null };
+      try { Object.assign(shift, await shiftReviewClock(this.host.databaseUrl(), this.state.requestId!, this.state.app!.connectionId!, Q3_REVIEW_AGE_MS)); }
+      catch (error) { shift.error = errorText(error); }
+      this.state.timeShift = shift;
+      timeline.add("journey_review_aged", { taskId: plan.taskId, ...shift });
+    }
+    if (!this.state.refresh) {
+      // Apps → connection → Check connection: a routine use that renews the expiring token.
+      const refresh: NonNullable<JourneyRecord["refresh"]> = { at: Date.now(), httpStatus: null, error: null };
+      try { await api.post(`/api/tool-connections/${this.state.app!.connectionId}/health-check`, {}, 30_000); refresh.httpStatus = 200; }
+      catch (error) { refresh.httpStatus = httpStatus(error); refresh.error = errorText(error); }
+      this.state.refresh = refresh;
+      timeline.add("journey_connection_checked", { taskId: plan.taskId, ...refresh, refreshes: this.app?.record.refreshes.length ?? null });
+    }
+  }
+
+  private async respond(now: number) {
+    const { api, lab, record, plan, timeline } = this.host;
+    const answer: NonNullable<JourneyRecord["answer"]> = { at: now, doneAt: now, httpStatus: null, error: null, status: null,
+      pendingWhenAnswered: false, faultsBefore: record.faultIds.length };
+    try {
+      const status = await this.requestStatus();
+      answer.pendingWhenAnswered = status === "pending";
+      if (status !== "pending") throw new Error(`the saved request is no longer pending (status ${status ?? "missing"})`);
+      answer.at = Date.now();
+      const response = this.workload === "Q3"
+        ? await api.post<Json>(`/api/tool-gateway/action-requests/${this.state.requestId}/approve`, { companyId: lab.companyId }, 60_000)
+        : await api.post<Json>(`/api/issues/${record.issueId}/interactions/${this.state.requestId}/respond`,
+          { answers: [{ questionId: QUESTION_ID, optionIds: [journeyChoice(plan.nonce)] }] }, 30_000);
+      answer.httpStatus = 200;
+      answer.status = typeof response?.status === "string" ? response.status : null;
+    } catch (error) {
+      answer.httpStatus = httpStatus(error);
+      answer.error = errorText(error);
+    }
+    answer.doneAt = Math.max(Date.now(), now);
+    this.state.answer = answer;
+    timeline.add("journey_board_responded", { taskId: plan.taskId, workload: this.workload, requestId: this.state.requestId, ...answer });
+  }
+
+  private async requestStatus(): Promise<string | null> {
+    const { api, lab, record } = this.host;
+    if (this.workload === "Q3") {
+      const rows = await api.get<Json[] | { actionRequests?: Json[] }>(`/api/companies/${lab.companyId}/tools/action-requests?status=pending`, 10_000);
+      const list = Array.isArray(rows) ? rows : rows?.actionRequests ?? [];
+      return list.some(row => row.id === this.state.requestId) ? "pending" : "not pending";
+    }
+    const rows = await api.get<Json[]>(`/api/issues/${record.issueId}/interactions`, 10_000);
+    return rows.find(row => row.id === this.state.requestId)?.status ?? null;
+  }
+
+  /** Q2: the agent's reply to the answer, while the prerequisite is still unfinished. */
+  private async observeAnswerTurn(now: number, sample: TaskSample): Promise<boolean> {
+    const { api, record, plan, timeline } = this.host;
+    if (hasActiveRun(sample)) return false;
+    const comments = await api.get<Json[]>(`/api/issues/${record.issueId}/comments`, 5_000).catch(() => null);
+    const since = this.state.answer!.at;
+    const reply = (comments ?? []).find(comment => comment.authorAgentId && String(comment.body ?? "").includes(answerMarker(plan.nonce))
+      && Date.parse(comment.createdAt) >= since - 1_000);
+    if (!reply) return false;
+    const issue = await api.get<Json>(`/api/issues/${record.issueId}`, 5_000).catch(() => null);
+    const blockerId = this.state.blocker?.issueId;
+    const blockedBy = Array.isArray(issue?.blockedBy) ? issue.blockedBy as Json[] : [];
+    this.state.answerTurn = { at: Date.parse(reply.createdAt), issueStatus: issue?.status ?? null,
+      blockerKept: Boolean(blockerId) && (blockedBy.some(row => row.id === blockerId) || (issue?.blockedByIssueIds ?? []).includes(blockerId)) };
+    timeline.add("journey_answer_turn", { taskId: plan.taskId, observedAt: now, ...this.state.answerTurn });
+    return true;
+  }
+
+  private async finishPrerequisite(now: number) {
+    const { api, plan, timeline } = this.host;
+    const resolved: NonNullable<JourneyRecord["blockerResolved"]> = { at: now, error: null };
+    try { await api.patch(`/api/issues/${this.state.blocker!.issueId}`, { status: "done" }); }
+    catch (error) { resolved.error = errorText(error); }
+    this.state.blockerResolved = resolved;
+    timeline.add("journey_prerequisite_finished", { taskId: plan.taskId, ...resolved });
+  }
+
+  async collect(issueId: string): Promise<JourneyArtifacts> {
+    const { api, lab } = this.host;
+    const [issue, interactions, comments, runs] = await Promise.all([
+      api.get<Json>(`/api/issues/${issueId}`).catch(() => null),
+      api.get<Json[]>(`/api/issues/${issueId}/interactions`).catch(() => []),
+      api.get<Json[]>(`/api/issues/${issueId}/comments`).catch(() => []),
+      api.get<Json[]>(`/api/issues/${issueId}/runs`).catch(() => []),
+    ]);
+    const interruption = issue?.interruption ? { state: issue.interruption.state ?? null, canRetry: issue.interruption.canRetry === true } : null;
+    const artifacts: JourneyArtifacts = {
+      record: this.state,
+      questions: (interactions ?? []).filter(row => row.kind === "ask_user_questions")
+        .map(row => ({ id: String(row.id), status: String(row.status), createdAt: row.createdAt ?? null })),
+      agentComments: (comments ?? []).filter(comment => comment.authorAgentId)
+        .map(comment => ({ createdAt: Date.parse(comment.createdAt), body: String(comment.body ?? "") })).sort((a, b) => a.createdAt - b.createdAt),
+      runErrorCodes: (runs ?? []).map(run => run.errorCode).filter((code): code is string => typeof code === "string"),
+      interruption,
+    };
+    if (this.workload === "Q3") {
+      const rows = await Promise.all(["pending", "approved", "executing", "executed", "failed", "declined", "expired", "cancelled"]
+        .map(status => api.get<Json[] | { actionRequests?: Json[] }>(`/api/companies/${lab.companyId}/tools/action-requests?status=${status}`).catch(() => [])));
+      const requests = new Map<string, string>();
+      for (const page of rows) for (const row of Array.isArray(page) ? page : page?.actionRequests ?? []) {
+        if (row.issueId === issueId) requests.set(String(row.id), String(row.status));
+      }
+      artifacts.actionRequests = [...requests].map(([id, status]) => ({ id, status }));
+      artifacts.provider = this.app ? { toolCalls: [...this.app.record.toolCalls], refreshes: [...this.app.record.refreshes] } : { toolCalls: [], refreshes: [] };
+    }
+    return artifacts;
+  }
+
+  async close(): Promise<void> { await this.app?.close().catch(() => undefined); this.app = null; }
+}
+
+/**
+ * Q3: the honest way to let more than an hour pass for one review in an isolated wave database.
+ * The pending request's created/updated/deadline timestamps and the OAuth grant's access-token
+ * expiry (and last refresh) move back by `ms`, as GRACE_SHIFT_MS does for the invariant pass.
+ * Nothing else changes; the product's own code decides what that elapsed time means.
+ */
+export async function shiftReviewClock(databaseUrl: string | null, actionRequestId: string, connectionId: string, ms: number) {
+  if (!databaseUrl) throw new Error("the wave database URL is unknown");
+  const { createDb } = await import("../../packages/db/src/index.js");
+  const db = createDb(databaseUrl);
+  const client = (db as unknown as { $client: { unsafe(query: string, params?: unknown[]): Promise<Json[]>; end(options?: { timeout?: number }): Promise<void> } }).$client;
+  try {
+    const interval = `${Math.round(ms / 1000)} seconds`;
+    const requests = await client.unsafe(`UPDATE tool_action_requests SET created_at = created_at - $2::interval,
+      updated_at = updated_at - $2::interval, expires_at = expires_at - $2::interval
+      WHERE id = $1 AND status = 'pending' RETURNING id`, [actionRequestId, interval]);
+    const grants = await client.unsafe(`SELECT id, provider_tenant FROM connection_grants WHERE connection_id = $1`, [connectionId]);
+    let shiftedGrants = 0;
+    for (const grant of grants) {
+      const tenant = (grant.provider_tenant ?? {}) as Json;
+      const oauth = { ...(tenant.oauth ?? {}) } as Json;
+      let changed = false;
+      for (const key of ["accessTokenExpiresAt", "refreshedAt", "expiresAt"]) {
+        const at = typeof oauth[key] === "string" ? Date.parse(oauth[key]) : Number.NaN;
+        if (Number.isFinite(at)) { oauth[key] = new Date(at - ms).toISOString(); changed = true; }
+      }
+      if (!changed) continue;
+      await client.unsafe(`UPDATE connection_grants SET provider_tenant = $2::jsonb WHERE id = $1`, [grant.id, JSON.stringify({ ...tenant, oauth })]);
+      shiftedGrants += 1;
+    }
+    return { requests: requests.length, grants: shiftedGrants };
+  } finally {
+    await client.end({ timeout: 5 }).catch(() => undefined);
+  }
+}
+
+/** The wave database URL from the instance config (as main.ts reads it for the crash-point suite). */
+export function databaseUrlFromConfig(configPath: string | undefined): string | null {
+  if (!configPath) return null;
+  try {
+    return (JSON.parse(readFileSync(configPath, "utf8")) as { database?: { connectionString?: string } }).database?.connectionString ?? null;
+  } catch { return null; }
+}
+
+export function journeyDriverFor(host: JourneyHost): JourneyDriver | null {
+  return isJourneyWorkload(host.plan.workload) ? new JourneyDriver(host.plan.workload, host) : null;
+}
