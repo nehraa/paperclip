@@ -9,7 +9,7 @@ import { ChaosApiError, type ChaosApi } from "./api.js";
 import { ACTIVE_RUN_STATUSES } from "./grader.js";
 import { startOAuthApp, TOOL_NAME, type OAuthApp } from "./journey-oauth-app.js";
 import {
-  ANSWER_TURN_WAIT_MS, answerMarker, isJourneyWorkload, journeyChoice, Q3_REVIEW_AGE_MS, q3ToolArgument, QUESTION_ID,
+  ANSWER_TURN_WAIT_MS, answerMarker, isJourneyWorkload, journeyChoice, Q3_REVIEW_AGE_MS, q3ToolArgument,
   type JourneyArtifacts, type JourneyRecord, type JourneyWorkload,
 } from "./journeys.js";
 import type { ChaosLab } from "./seed.js";
@@ -41,6 +41,21 @@ export interface JourneyTick {
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const httpStatus = (error: unknown) => error instanceof ChaosApiError ? error.status : null;
 const hasActiveRun = (sample: TaskSample) => (sample.runs ?? []).some(run => ACTIVE_RUN_STATUSES.has(run.status));
+
+/**
+ * The board's answer as the question form sends it: the option whose id or label is the chosen
+ * code word. The agent wrote the card with its own ids, so the board reads them, as a person would.
+ */
+export function questionAnswer(interaction: Json, choice: string): { questionId: string; optionIds: string[] } | null {
+  const payload = (interaction.payload ?? {}) as Json;
+  const questions = [...(payload.questionSet?.questions ?? []), ...(payload.questions ?? [])] as Json[];
+  for (const question of questions) {
+    const option = ((question.options ?? []) as Json[]).find(candidate => [candidate.id, candidate.label]
+      .some(value => typeof value === "string" && value.trim().toLowerCase() === choice));
+    if (option && typeof question.id === "string") return { questionId: question.id, optionIds: [String(option.id)] };
+  }
+  return null;
+}
 
 /** The scripted Q3 agent: one connected-app call, then report the reviewed result. Adapted from tests/e2e/connection-reviews.spec.ts. */
 export function q3AgentScript(connectionId: string, title: string): string {
@@ -244,14 +259,16 @@ export class JourneyDriver {
     const answer: NonNullable<JourneyRecord["answer"]> = { at: now, doneAt: now, httpStatus: null, error: null, status: null,
       pendingWhenAnswered: false, faultsBefore: record.faultIds.length };
     try {
-      const status = await this.requestStatus();
+      const request = await this.currentRequest();
+      const status = request?.status ?? null;
       answer.pendingWhenAnswered = status === "pending";
       if (status !== "pending") throw new Error(`the saved request is no longer pending (status ${status ?? "missing"})`);
+      const choice = this.workload === "Q3" ? null : questionAnswer(request!, journeyChoice(plan.nonce));
+      if (this.workload !== "Q3" && !choice) throw new Error(`the saved question offers no option "${journeyChoice(plan.nonce)}"`);
       answer.at = Date.now();
       const response = this.workload === "Q3"
         ? await api.post<Json>(`/api/tool-gateway/action-requests/${this.state.requestId}/approve`, { companyId: lab.companyId }, 60_000)
-        : await api.post<Json>(`/api/issues/${record.issueId}/interactions/${this.state.requestId}/respond`,
-          { answers: [{ questionId: QUESTION_ID, optionIds: [journeyChoice(plan.nonce)] }] }, 30_000);
+        : await api.post<Json>(`/api/issues/${record.issueId}/interactions/${this.state.requestId}/respond`, { answers: [choice] }, 30_000);
       answer.httpStatus = 200;
       answer.status = typeof response?.status === "string" ? response.status : null;
     } catch (error) {
@@ -263,15 +280,16 @@ export class JourneyDriver {
     timeline.add("journey_board_responded", { taskId: plan.taskId, workload: this.workload, requestId: this.state.requestId, ...answer });
   }
 
-  private async requestStatus(): Promise<string | null> {
+  /** The saved request as the board sees it now (Q3: listed only while pending). */
+  private async currentRequest(): Promise<Json | null> {
     const { api, lab, record } = this.host;
     if (this.workload === "Q3") {
       const rows = await api.get<Json[] | { actionRequests?: Json[] }>(`/api/companies/${lab.companyId}/tools/action-requests?status=pending`, 10_000);
       const list = Array.isArray(rows) ? rows : rows?.actionRequests ?? [];
-      return list.some(row => row.id === this.state.requestId) ? "pending" : "not pending";
+      return list.some(row => row.id === this.state.requestId) ? { status: "pending" } : { status: "not pending" };
     }
     const rows = await api.get<Json[]>(`/api/issues/${record.issueId}/interactions`, 10_000);
-    return rows.find(row => row.id === this.state.requestId)?.status ?? null;
+    return rows.find(row => row.id === this.state.requestId) ?? null;
   }
 
   /** Q2: the agent's reply to the answer, while the prerequisite is still unfinished. */

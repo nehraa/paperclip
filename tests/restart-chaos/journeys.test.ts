@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseCommand } from "./config.js";
-import { JourneyDriver, type JourneyHost } from "./journey-driver.js";
+import { JourneyDriver, questionAnswer, type JourneyHost } from "./journey-driver.js";
 import { matrixCells, planMatrixWave } from "./journey-matrix.js";
 import { startOAuthApp } from "./journey-oauth-app.js";
 import {
@@ -160,7 +160,8 @@ describe("journey driver", () => {
       trigger, triggerDelayMs: 0, followUpAfterMs: null, nonce };
     const record = { plan, issueId: "issue-1", faultIds: [] } as unknown as TaskRecord;
     const calls: string[] = [];
-    let interaction = { id: "i1", kind: "ask_user_questions", status: "pending" };
+    let interaction = { id: "i1", kind: "ask_user_questions", status: "pending", payload: { version: 1, questions: [{ id: "codeword",
+      prompt: "Which code word?", options: [{ id: "opt-a", label: "Amber" }, { id: "opt-c", label: "Cobalt" }] }] } };
     const api = {
       baseUrl: "http://x",
       async get(route: string) {
@@ -181,6 +182,13 @@ describe("journey driver", () => {
       timeline: new Timeline(null), record, databaseUrl: () => null };
     return { driver: new JourneyDriver(workload, host), calls, record };
   }
+  it("answers with the agent's own question and option ids, matched by the chosen code word", () => {
+    const card = { payload: { questionSet: { questions: [{ id: "q-7", options: [{ id: "x", label: " Cobalt " }, { id: "amber", label: "Warm" }] }] } } };
+    expect(questionAnswer(card, "cobalt")).toEqual({ questionId: "q-7", optionIds: ["x"] });
+    expect(questionAnswer(card, "amber")).toEqual({ questionId: "q-7", optionIds: ["amber"] });
+    expect(questionAnswer({ payload: {} }, "amber")).toBeNull();
+  });
+
   const sample = (runs: TaskSample["runs"] = []): TaskSample => ({ at: 0, reachable: true, serverReady: true, runs });
   const answeredFault: ScheduledFault = { kind: "K1", holdMs: 0, atMs: 0, trigger: "answered", delayMs: 0 };
 
@@ -193,7 +201,8 @@ describe("journey driver", () => {
     expect(calls).toEqual([]);
     record.faultIds.push("f1");
     expect(await driver.step({ sample: sample(), now: 5_000, quiet: true, pendingFaults: [] })).toBe(true);
-    expect(calls).toEqual([`POST /api/issues/issue-1/interactions/i1/respond {"answers":[{"questionId":"codeword","optionIds":["${journeyChoice(nonce)}"]}]}`]);
+    const optionId = journeyChoice(nonce) === "amber" ? "opt-a" : "opt-c";
+    expect(calls).toEqual([`POST /api/issues/issue-1/interactions/i1/respond {"answers":[{"questionId":"codeword","optionIds":["${optionId}"]}]}`]);
     expect(driver.armedAt("answered")).toBeGreaterThanOrEqual(5_000);
     expect(record.journey!.answer).toMatchObject({ pendingWhenAnswered: true, faultsBefore: 1, error: null });
     expect(driver.awaitingBoard()).toBe(false);

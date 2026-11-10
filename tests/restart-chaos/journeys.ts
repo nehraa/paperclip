@@ -40,7 +40,6 @@ export const Q3_REVIEW_AGE_MS = 61 * 60_000;
 /** Q2: how long the board waits (server ready) for the answer turn before it finishes the prerequisite anyway. */
 export const ANSWER_TURN_WAIT_MS = 6 * 60_000;
 
-export const QUESTION_ID = "codeword";
 export const CODE_WORDS = ["amber", "cobalt"] as const;
 /** The board's answer, fixed by the nonce so the agent cannot guess it. */
 export function journeyChoice(nonce: string): (typeof CODE_WORDS)[number] {
@@ -174,29 +173,20 @@ export function gradeToolReviewJourney(nonce: string, artifacts: OracleArtifacts
   ]);
 }
 
-const questionBody = (nonce: string) => JSON.stringify({
-  kind: "ask_user_questions",
-  idempotencyKey: `journey:${nonce}:codeword`,
-  title: questionTitle(nonce),
-  resolverPolicy: "human_only",
-  continuationPolicy: "wake_assignee",
-  payload: { version: 1, questionSet: { schema: "paperclip.question_set.v1", questions: [{
-    id: QUESTION_ID, prompt: "Which code word should the brief use?", answerMode: "single_select", required: true,
-    options: CODE_WORDS.map(word => ({ id: word, label: word[0]!.toUpperCase() + word.slice(1) })),
-  }] } },
-});
-
+// The agent saves the question through its native `request_human_input` tool, the governed wait
+// whose saved handoff #20336 keeps across a provider shutdown.
 const askSteps = (nonce: string) => [
   "Before writing anything, you need one answer from the board.",
-  "1. Save exactly one question card with the `call_api` tool: operationId `POST /api/issues/{issueId}/interactions`,",
-  `   pathParams \`{ "issueId": "<this task's id>" }\`, and this body: \`${questionBody(nonce)}\``,
-  "2. Then set this task's status to `in_review` and end your turn. Do not write the brief yet and do not ask again.",
+  "1. Ask exactly one question with your `request_human_input` tool: a questions card (continuationPolicy `wake_assignee`,",
+  `   idempotencyKey \`journey-${nonce}\`, title \"${questionTitle(nonce)}\") with one required single-select question`,
+  `   "Which code word should the brief use?" and exactly two options labelled \`${CODE_WORDS[0]}\` and \`${CODE_WORDS[1]}\`.`,
+  "2. Then end your turn and wait for the answer. Do not guess, do not ask again, and do not write the brief yet.",
 ];
 
 const briefSteps = (nonce: string) => [
   "Save this issue's document with key `brief` (title \"Brief\"), in markdown, on why idempotent retries matter for background job queues.",
   `It must contain the line \`${briefMarker(nonce)}\` exactly, on its own line, and the line \`ANSWER-${nonce}-<code word>\` on its own line,`,
-  "where <code word> is the option id the board chose (lowercase), and at least three bullet points that start with \"- \".",
+  "where <code word> is the option the board chose, in lowercase, and at least three bullet points that start with \"- \".",
   "Then mark this task done. Do not create files or other tasks.",
 ];
 
