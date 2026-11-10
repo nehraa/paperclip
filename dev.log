@@ -1,0 +1,41 @@
+nohup: ignoring input
+
+> paperclip@ dev /home/Hermes/paperclip
+> pnpm --filter @paperclipai/server exec tsx ../scripts/dev-runner.ts watch
+
+[paperclip] dev mode: local_trusted (default)
+[paperclip] building plugin sdk...
+
+> @paperclipai/plugin-sdk@1.0.0 build /home/Hermes/paperclip/packages/plugins/sdk
+> pnpm --filter @paperclipai/shared build && tsc
+
+
+> @paperclipai/shared@0.3.1 build /home/Hermes/paperclip/packages/shared
+> tsc
+
+
+> @paperclipai/server@0.3.1 dev:watch /home/Hermes/paperclip/server
+> cross-env PAPERCLIP_MIGRATION_PROMPT=never PAPERCLIP_MIGRATION_AUTO_APPLY=true tsx ./scripts/dev-watch.ts
+
+node:events:497
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: EBADF: bad file descriptor, read
+Emitted 'error' event on ReadStream instance at:
+    at emitErrorNT (node:internal/streams/destroy:170:8)
+    at errorOrDestroy (node:internal/streams/destroy:239:7)
+    at node:internal/fs/streams:275:9
+    at FSReqCallback.wrapper [as oncomplete] (node:fs:669:5) {
+  errno: -9,
+  code: 'EBADF',
+  syscall: 'read'
+}
+
+Node.js v22.22.2
+ ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @paperclipai/server@0.3.1 dev:watch: `cross-env PAPERCLIP_MIGRATION_PROMPT=never PAPERCLIP_MIGRATION_AUTO_APPLY=true tsx ./scripts/dev-watch.ts`
+Exit status 1
+undefined
+/home/Hermes/paperclip/server:
+ ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL  Command failed with exit code 1: tsx ../scripts/dev-runner.ts watch
+ ELIFECYCLE  Command failed with exit code 1.
