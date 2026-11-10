@@ -147,6 +147,7 @@ export class JourneyDriver {
     } catch (error) {
       state.setupError = errorText(error);
       timeline.add("journey_app_setup_failed", { taskId: plan.taskId, error: state.setupError });
+      throw new Error(`Q3 app setup failed: ${state.setupError}`);
     }
   }
 
