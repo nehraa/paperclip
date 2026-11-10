@@ -67,7 +67,9 @@ const api = async (path, method = "GET", body) => {
   if (!response.ok) throw new Error(method + " " + path + " " + response.status + ": " + await response.text());
   return await response.json();
 };
-const issueId = process.env.PAPERCLIP_TASK_ID ?? (await api("/heartbeat-runs/" + process.env.PAPERCLIP_RUN_ID)).contextSnapshot.issueId;
+let issueId = process.env.PAPERCLIP_TASK_ID;
+try {
+issueId ??= (await api("/heartbeat-runs/" + process.env.PAPERCLIP_RUN_ID)).contextSnapshot.issueId;
 const review = (await api("/issues/" + issueId + "/interactions")).find(item => item.payload?.toolAction);
 if (review?.status === "pending") { console.log("Waiting for the saved review; no retry."); process.exit(0); }
 if (review) {
@@ -92,6 +94,12 @@ if (!call.ok) {
   process.exit(0);
 }
 await api("/issues/" + issueId + "/comments", "POST", { body: "Q3 ran without review: " + JSON.stringify(outcome) });
+} catch (error) {
+  // Leave the failure on the task, where the evidence bundle collects it.
+  console.error(error);
+  if (issueId) await api("/issues/" + issueId + "/comments", "POST", { body: "Q3 agent error: " + String(error?.stack ?? error).slice(0, 2000) }).catch(() => {});
+  process.exit(1);
+}
 `;
 }
 
@@ -140,6 +148,11 @@ export class JourneyDriver {
         adapterConfig: { command: process.execPath, args: ["--input-type=module", "-e", q3AgentScript(state.connectionId, q3ToolArgument(plan.nonce))] },
       });
       state.agentId = String(agent.id);
+      // A scripted process run records usage with no price, which the company's default budget
+      // policy blocks (pausing the whole company). The operator allows unpriced usage, as the
+      // budget page offers; the amount and hard stop stay in force for priced model usage.
+      await api.post(`/api/companies/${lab.companyId}/budgets/policies`,
+        { scopeType: "company", scopeId: lab.companyId, unpricedUsagePolicy: "allow" });
       // Apps → finish: this agent may use the app, and the write tool asks first.
       await api.post(`/api/companies/${lab.companyId}/tools/apps/${state.connectionId}/finish`, {
         enabledCatalogEntryIds: [entry.id], askFirstCatalogEntryIds: [entry.id], access: { agentIds: [state.agentId] } });
